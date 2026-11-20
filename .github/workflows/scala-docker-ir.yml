@@ -1,0 +1,112 @@
+name: Scala Docker - baseline vs InvisiRisk
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: Enable verbose InvisiRisk diagnostics
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+
+env:
+  IR_API_URL: https://app.stage.invisirisk.com
+  NO_PROXY: app.stage.invisirisk.com,localhost,127.0.0.1
+  DOCKER_BUILDKIT: "1"
+  BAF_FRONTEND: public.ecr.aws/w3c0c0n7/invisirisk/baf-buildkit@sha256:7e3e051a0e9e26b09043b421742f33b83ffaa0cf4f47a957152b6e17571a2249
+
+jobs:
+  baseline-docker:
+    name: Baseline Scala Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build normally
+        run: docker build --tag scala-docker-baseline:${{ github.run_id }} .
+      - name: Run image
+        run: docker run --rm scala-docker-baseline:${{ github.run_id }}
+      - name: Extract generated CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          id=$(docker create scala-docker-baseline:${{ github.run_id }})
+          trap 'docker rm -f "${id}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${id}:/home/sbtuser/app/target" docker-target
+          bom=$(find docker-target -type f -name '*.bom.json' -print -quit)
+          test -n "${bom}"
+          echo "Baseline Docker SBOM components: $(jq '.components | length' "${bom}")"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scala-docker-baseline-cyclonedx
+          path: docker-target/**/*.bom.json
+          if-no-files-found: error
+
+  ir-docker:
+    name: InvisiRisk Scala Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require staging project token
+        shell: bash
+        env:
+          IR_API_KEY: ${{ secrets.IR_API_KEY }}
+        run: |
+          if [[ -z "${IR_API_KEY}" ]]; then
+            echo "::error::Configure the IR_API_KEY repository secret with an owned staging project token."
+            exit 1
+          fi
+      - name: Start InvisiRisk BAF
+        uses: invisirisk/pse-action@1b65605f8d71a0c840878bc90ba262fe7bf7ed2b
+        with:
+          api_url: ${{ env.IR_API_URL }}
+          app_token: ${{ secrets.IR_API_KEY }}
+          job_identifier: scala-docker-sbt-${{ github.run_id }}
+          job_label: Scala Docker sbt
+          workdir: ${{ github.workspace }}
+          collect_dependencies: "false"
+          collect_job_status: "true"
+          debug: ${{ inputs.debug }}
+      - name: Validate BAF readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PSE_PROXY_IP:-}"
+          test -n "${PSE_CA_CERT_PATH:-}"
+          test -f "${PSE_CA_CERT_PATH}"
+          echo "NO_PROXY=app.stage.invisirisk.com,localhost,127.0.0.1" >> "${GITHUB_ENV}"
+          echo "no_proxy=app.stage.invisirisk.com,localhost,127.0.0.1" >> "${GITHUB_ENV}"
+      - name: Build through InvisiRisk BAF frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          proxy="${PSE_PROXY:-http://${PSE_PROXY_IP}:3128}"
+          docker build \
+            --tag scala-docker-ir:${{ github.run_id }} \
+            --build-arg "BUILDKIT_SYNTAX=${BAF_FRONTEND}" \
+            --build-arg "PSE_PROXY=${proxy}" \
+            --secret "id=pse-ca,src=${PSE_CA_CERT_PATH}" .
+      - name: Run image
+        run: docker run --rm scala-docker-ir:${{ github.run_id }}
+      - name: Extract generated CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          id=$(docker create scala-docker-ir:${{ github.run_id }})
+          trap 'docker rm -f "${id}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${id}:/home/sbtuser/app/target" docker-target
+          bom=$(find docker-target -type f -name '*.bom.json' -print -quit)
+          test -n "${bom}"
+          echo "IR Docker SBOM components: $(jq '.components | length' "${bom}")"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scala-docker-ir-cyclonedx
+          path: docker-target/**/*.bom.json
+          if-no-files-found: warn
